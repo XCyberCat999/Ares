@@ -1,0 +1,1081 @@
+#!/usr/bin/env python3
+
+"""
+ARES Network Service Scanner
+Version: 0.1.0
+Author:  Anna.H - XCyberCati999 / CyberProxSystems
+License: MIT
+URL:     https://github.com/XCyberCat999/
+"""
+
+import subprocess
+import xml.etree.ElementTree as ET
+import argparse
+import configparser
+import os
+import sys
+import json
+import time
+import logging
+import socket
+import sqlite3
+import requests
+from datetime import datetime, timezone
+
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
+# ─── ROOT CHECK ───────────────────────────────────────────────────────────────
+
+if os.geteuid() != 0:
+    print("Error: ARES requires root privileges.")
+    print("       Please run with: sudo ares")
+    sys.exit(1)
+
+# ─── CONSTANTS ────────────────────────────────────────────────────────────────
+
+DB_PATH      = "/var/lib/ares/ares.db"
+LOG_PATH     = "/var/log/ares/ares.log"
+CONF_PATH    = "/etc/ares/ares.conf"
+CONF_DIR     = "/etc/ares"
+
+# ANSI color codes – no external dependency needed
+RESET  = "\033[0m"
+RED    = "\033[31m"
+GREEN  = "\033[32m"
+YELLOW = "\033[33m"
+BOLD   = "\033[1m"
+
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+
+def load_config() -> configparser.ConfigParser:
+    """
+    Loads configuration from /etc/ares/ares.conf.
+    Returns a ConfigParser object.
+    If the file does not exist, returns an empty config.
+    """
+    config = configparser.ConfigParser()
+    if os.path.isfile(CONF_PATH):
+        config.read(CONF_PATH)
+    return config
+
+
+def get_networks(config: configparser.ConfigParser) -> list:
+    """
+    Extracts all [network:name] sections from the config.
+    Returns a list of network dicts.
+
+    Each dict contains:
+      name      → section name (e.g. 'lan')
+      network   → CIDR notation (e.g. '192.168.2.0/24')
+      interface → network interface (e.g. 'eth1'), optional
+      mode      → 'arp' (L2, MAC visible) or 'ip' (L3, no MAC)
+    """
+    networks = []
+    for section in config.sections():
+        if section.startswith("network:"):
+            name = section.split(":", 1)[1]
+            networks.append({
+                "name":      name,
+                "network":   config.get(section, "network", fallback=""),
+                "interface": config.get(section, "interface", fallback=""),
+                "mode":      config.get(section, "mode", fallback="arp"),
+            })
+    return networks
+
+
+# ─── STRUCTURED JSON LOGGER ───────────────────────────────────────────────────
+
+# Create log and config directories BEFORE logging is initialized
+os.makedirs("/var/log/ares", exist_ok=True)
+os.makedirs(CONF_DIR, exist_ok=True)
+
+# Read hostname dynamically from the system
+HOSTNAME = socket.gethostname()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",              # JSON string only, no prefix
+    handlers=[
+        logging.FileHandler(LOG_PATH),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+def log_event(event: str, level: str = "info", **kwargs):
+    """Writes a structured JSON event to the log."""
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "level": level,
+        "event": event,
+        "host": HOSTNAME,
+        "job": "ares-scanner",
+        **kwargs
+    }
+    msg = json.dumps(entry)
+    if level == "warn":
+        logging.warning(msg)
+    elif level == "error":
+        logging.error(msg)
+    else:
+        logging.info(msg)
+    return msg
+
+
+# ─── LOKI PUSH ────────────────────────────────────────────────────────────────
+
+def push_to_loki(loki_url: str, json_line: str, level: str = "info"):
+    """Pushes a log entry directly to the Loki Push API."""
+    payload = {
+        "streams": [{
+            "stream": {
+                "job": "ares-scanner",
+                "host": HOSTNAME,
+                "level": level
+            },
+            "values": [[
+                str(int(time.time() * 1e9)),   # nanosecond timestamp
+                json_line
+            ]]
+        }]
+    }
+    try:
+        resp = requests.post(
+            f"{loki_url}/loki/api/v1/push",
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=5
+        )
+        if resp.status_code != 204:
+            print(f"[WARN] Loki response: {resp.status_code} {resp.text}")
+    except requests.exceptions.RequestException as e:
+        print(f"[ERROR] Loki push failed: {e}")
+
+
+def log_and_push(loki_url: str | None, event: str, level: str = "info", **kwargs):
+    """Combines log_event() + push_to_loki() in a single call."""
+    json_line = log_event(event, level, **kwargs)
+    if loki_url:
+        push_to_loki(loki_url, json_line, level)
+
+
+# ─── NMAP SCAN ────────────────────────────────────────────────────────────────
+
+def run_nmap(network: str, interface: str = "", mode: str = "arp") -> str:
+    """
+    Runs a device discovery scan.
+    mode='arp'  → ARP scan, MAC addresses visible (L2 only)
+    mode='ip'   → ping scan, no MAC addresses (L3 / remote networks)
+    """
+    if mode == "arp":
+        cmd = ["nmap", "-sn", "-PR", network, "-oX", "-"]
+        if interface:
+            cmd += ["-e", interface]
+    else:
+        cmd = ["nmap", "-sn", network, "-oX", "-"]
+
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"Nmap-Error: {proc.stderr.strip()}")
+    return proc.stdout
+
+
+def run_nmap_services(network: str, interface: str = "") -> str:
+    """Runs a full service and version scan."""
+    cmd = ["nmap", "-sV", "--version-intensity", "9", network, "-oX", "-"]
+    if interface:
+        cmd += ["-e", interface]
+
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"Nmap-Error: {proc.stderr.strip()}")
+    return proc.stdout
+
+
+# ─── PARSE XML ────────────────────────────────────────────────────────────────
+
+def parse_nmap_xml(xml_text: str):
+    devices = []
+    root = ET.fromstring(xml_text)
+    for host in root.findall("host"):
+        ip = ""
+        mac = ""
+        hostname = ""
+        for addr in host.findall("address"):
+            if addr.get("addrtype") in ("ipv4", "ipv6"):
+                ip = addr.get("addr", "")
+            elif addr.get("addrtype") == "mac":
+                mac = addr.get("addr", "").upper()
+        hn = host.find("hostnames/hostname")
+        if hn is not None:
+            hostname = hn.get("name", "")
+        devices.append({"hostname": hostname, "ip": ip, "mac": mac})
+    return devices
+
+
+def parse_nmap_services_xml(xml_text: str):
+    services = []
+    root = ET.fromstring(xml_text)
+    for host in root.findall("host"):
+        hostname = ""
+        hn = host.find("hostnames/hostname")
+        if hn is not None:
+            hostname = hn.get("name", "")
+        ports = []
+        for port in host.findall("ports/port"):
+            portid = port.get("portid")
+            state = port.find("state").get("state")
+            svc = port.find("service")
+            service_name = svc.get("name") if svc is not None else ""
+            service_version = svc.get("version") if svc is not None else ""
+            ports.append({"port": portid, "state": state,
+                          "service": service_name, "version": service_version})
+        services.append({"hostname": hostname or "-", "ports": ports})
+    return services
+
+
+# ─── PRINT HELPERS ────────────────────────────────────────────────────────────
+
+def print_devices_list(devices):
+    print("\nFound devices:")
+    print("-----------------")
+    for d in devices:
+        print(f"Hostname: {d['hostname'] or '-'}")
+        print(f"IP:       {d['ip']}")
+        print(f"MAC:      {d['mac'] or '-'}\n")
+
+
+def print_services_list(services):
+    print("\nFound services:")
+    print("-----------------------------")
+    for s in services:
+        print(f"\nHostname: {s['hostname']}")
+        print("-------------------------------------------")
+        print(f"{'Port':<6} {'State':<10} {'Service':<14} {'Version'}")
+        print("-------------------------------------------")
+        if not s["ports"]:
+            print("-")
+            continue
+        for p in s["ports"]:
+            print(f"{p['port']:<6} {p['state']:<10} {p['service']:<14} {p['version']}")
+
+
+# ─── DATABASE ─────────────────────────────────────────────────────────────────
+
+def db_init():
+    """
+    Creates the SQLite database and all tables if they don't exist yet.
+    Runs migration to add network column if it doesn't exist.
+    Safe to call on every start – existing data is never overwritten.
+    """
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS devices (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip          TEXT NOT NULL,
+            mac         TEXT,
+            hostname    TEXT,
+            first_seen  TEXT NOT NULL,
+            last_seen   TEXT NOT NULL,
+            status      TEXT NOT NULL DEFAULT 'pending',
+            network     TEXT NOT NULL DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS services (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id   INTEGER NOT NULL,
+            port        TEXT NOT NULL,
+            protocol    TEXT NOT NULL DEFAULT 'tcp',
+            service     TEXT,
+            version     TEXT,
+            first_seen  TEXT NOT NULL,
+            last_seen   TEXT NOT NULL,
+            FOREIGN KEY (device_id) REFERENCES devices(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS baseline (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id    INTEGER,
+            service_id   INTEGER,
+            accepted_at  TEXT NOT NULL,
+            FOREIGN KEY (device_id) REFERENCES devices(id),
+            FOREIGN KEY (service_id) REFERENCES services(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS events (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id   INTEGER,
+            service_id  INTEGER,
+            event_type  TEXT NOT NULL,
+            old_value   TEXT,
+            new_value   TEXT,
+            timestamp   TEXT NOT NULL,
+            FOREIGN KEY (device_id) REFERENCES devices(id),
+            FOREIGN KEY (service_id) REFERENCES services(id)
+        );
+    """)
+
+    # Migration – add network column to existing databases
+    try:
+        cur.execute("ALTER TABLE devices ADD COLUMN network TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # Column already exists – no action needed
+
+    conn.commit()
+    conn.close()
+
+
+def db_save_devices(devices: list, network: str) -> list:
+    """
+    Saves scanned devices to the database.
+    - New device   → INSERT, status='pending'
+    - Known device → UPDATE last_seen only
+    Returns a list of newly discovered devices.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    new_devices = []
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    for d in devices:
+        ip       = d["ip"]
+        mac      = d["mac"] or None
+        hostname = d["hostname"] or None
+
+        # Check if device already exists in DB (identified by MAC + network, fallback IP + network)
+        if mac:
+            cur.execute("SELECT id, status FROM devices WHERE mac = ? AND network = ?", (mac, network))
+        else:
+            cur.execute("SELECT id, status FROM devices WHERE ip = ? AND network = ?", (ip, network))
+
+        row = cur.fetchone()
+
+        if row is None:
+            # New device – INSERT
+            cur.execute("""
+                INSERT INTO devices (ip, mac, hostname, first_seen, last_seen, status, network)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?)
+            """, (ip, mac, hostname, now, now, network))
+            new_devices.append(d)
+        else:
+            # Known device – UPDATE last_seen
+            cur.execute("""
+                UPDATE devices SET last_seen = ?, ip = ?, hostname = ?
+                WHERE id = ?
+            """, (now, ip, hostname, row[0]))
+
+    conn.commit()
+    conn.close()
+
+    return new_devices
+
+
+def db_save_services(services: list) -> list:
+    """
+    Saves scanned services to the database.
+    - New service    → INSERT
+    - Known service  → UPDATE last_seen
+    - Version change → UPDATE + record change event
+    Returns a list of version change events.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    version_changes = []
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    for s in services:
+        # Find device in DB by hostname or skip if not found
+        cur.execute("SELECT id FROM devices WHERE hostname = ?", (s["hostname"],))
+        device_row = cur.fetchone()
+
+        if device_row is None:
+            # Device not in DB yet – skip
+            continue
+
+        device_id = device_row[0]
+
+        for p in s["ports"]:
+            port    = p["port"]
+            service = p["service"] or None
+            version = p["version"] or None
+
+            # Check if service already exists for this device + port
+            cur.execute("""
+                SELECT id, version FROM services
+                WHERE device_id = ? AND port = ?
+            """, (device_id, port))
+
+            row = cur.fetchone()
+
+            if row is None:
+                # New service – INSERT
+                cur.execute("""
+                    INSERT INTO services
+                        (device_id, port, protocol, service, version, first_seen, last_seen)
+                    VALUES (?, ?, 'tcp', ?, ?, ?, ?)
+                """, (device_id, port, service, version, now, now))
+
+            else:
+                service_id  = row[0]
+                old_version = row[1]
+
+                # Version changed?
+                if old_version != version and version is not None:
+                    version_changes.append({
+                        "device_id":   device_id,
+                        "service_id":  service_id,
+                        "port":        port,
+                        "service":     service,
+                        "old_version": old_version,
+                        "new_version": version,
+                    })
+
+                # UPDATE last_seen and version
+                cur.execute("""
+                    UPDATE services
+                    SET last_seen = ?, version = ?, service = ?
+                    WHERE id = ?
+                """, (now, version, service, service_id))
+
+    conn.commit()
+    conn.close()
+
+    return version_changes
+
+
+def db_check_deviations(network: str) -> list:
+    """
+    Checks for deviations from the accepted baseline.
+    Only checks devices and services within the given network.
+    Returns a list of deviation events.
+
+    Deviation types:
+    - new_device → device exists in DB but not in baseline
+    - new_port   → service exists in DB but not in baseline
+    """
+    deviations = []
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    # Check for devices not in baseline – only current network
+    cur.execute("""
+        SELECT d.id, d.ip, d.mac, d.hostname
+        FROM devices d
+        WHERE d.status = 'pending'
+        AND d.network = ?
+        AND d.id NOT IN (
+            SELECT device_id FROM baseline
+            WHERE device_id IS NOT NULL
+        )
+    """, (network,))
+
+    for row in cur.fetchall():
+        deviations.append({
+            "event_type": "new_device",
+            "device_id":  row[0],
+            "ip":         row[1],
+            "mac":        row[2] or "-",
+            "hostname":   row[3] or "-",
+        })
+
+    # Check for services not in baseline – only current network
+    cur.execute("""
+        SELECT s.id, s.device_id, s.port, s.service, s.version,
+               d.ip, d.hostname
+        FROM services s
+        JOIN devices d ON s.device_id = d.id
+        WHERE s.id NOT IN (
+            SELECT service_id FROM baseline
+            WHERE service_id IS NOT NULL
+        )
+        AND d.status = 'accepted'
+        AND d.network = ?
+    """, (network,))
+
+    for row in cur.fetchall():
+        deviations.append({
+            "event_type": "new_port",
+            "service_id": row[0],
+            "device_id":  row[1],
+            "port":       row[2],
+            "service":    row[3] or "-",
+            "version":    row[4] or "-",
+            "ip":         row[5],
+            "hostname":   row[6] or "-",
+        })
+
+    conn.close()
+
+    return deviations
+
+
+# ─── BASELINE ─────────────────────────────────────────────────────────────────
+
+def db_accept_baseline():
+    """
+    Freezes the current state as baseline.
+    All devices and services with status='pending' → status='accepted'.
+    Writes all accepted entries into the baseline table.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    cur.execute("""
+        UPDATE devices SET status = 'accepted'
+        WHERE status = 'pending'
+    """)
+
+    cur.execute("""
+        INSERT INTO baseline (device_id, service_id, accepted_at)
+        SELECT d.id, NULL, ?
+        FROM devices d
+        WHERE d.status = 'accepted'
+        AND d.id NOT IN (
+            SELECT device_id FROM baseline WHERE device_id IS NOT NULL
+        )
+    """, (now,))
+
+    cur.execute("""
+        INSERT INTO baseline (device_id, service_id, accepted_at)
+        SELECT s.device_id, s.id, ?
+        FROM services s
+        JOIN devices d ON s.device_id = d.id
+        WHERE d.status = 'accepted'
+        AND s.id NOT IN (
+            SELECT service_id FROM baseline WHERE service_id IS NOT NULL
+        )
+    """, (now,))
+
+    conn.commit()
+    conn.close()
+
+    print("[INFO] Baseline accepted and frozen.")
+
+
+def db_reset_baseline():
+    """
+    Resets the entire baseline.
+    All devices go back to status='pending'.
+    Baseline table is cleared.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    cur.executescript("""
+        UPDATE devices SET status = 'pending';
+        DELETE FROM baseline;
+    """)
+
+    conn.commit()
+    conn.close()
+
+    print("[INFO] Baseline reset. All devices set to pending.")
+
+
+def db_accept_device(ip: str):
+    """
+    Accepts a single device by IP address.
+    Sets status='accepted' and writes it into the baseline table.
+    Also accepts all services belonging to this device.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    cur.execute("SELECT id FROM devices WHERE ip = ?", (ip,))
+    row = cur.fetchone()
+
+    if row is None:
+        print(f"[WARN] Device {ip} not found in database.")
+        conn.close()
+        return
+
+    device_id = row[0]
+
+    cur.execute("UPDATE devices SET status = 'accepted' WHERE id = ?", (device_id,))
+
+    cur.execute("""
+        INSERT INTO baseline (device_id, service_id, accepted_at)
+        SELECT ?, NULL, ?
+        WHERE NOT EXISTS (
+            SELECT 1 FROM baseline WHERE device_id = ?
+        )
+    """, (device_id, now, device_id))
+
+    cur.execute("""
+        INSERT INTO baseline (device_id, service_id, accepted_at)
+        SELECT s.device_id, s.id, ?
+        FROM services s
+        WHERE s.device_id = ?
+        AND s.id NOT IN (
+            SELECT service_id FROM baseline WHERE service_id IS NOT NULL
+        )
+    """, (now, device_id))
+
+    conn.commit()
+    conn.close()
+
+    print(f"[INFO] Device {ip} accepted and added to baseline.")
+
+
+# ─── STATUS ───────────────────────────────────────────────────────────────────
+
+def db_get_status(network: str = None) -> dict:
+    """
+    Fetches current device status overview from the database.
+    If network is given, filters by network.
+    Returns a dict with devices and summary counters.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    if network:
+        cur.execute("""
+            SELECT d.id, d.ip, d.mac, d.hostname, d.status, d.last_seen,
+                   b.accepted_at, d.network
+            FROM devices d
+            LEFT JOIN baseline b ON d.id = b.device_id AND b.service_id IS NULL
+            WHERE d.network = ?
+            ORDER BY d.ip ASC
+        """, (network,))
+    else:
+        cur.execute("""
+            SELECT d.id, d.ip, d.mac, d.hostname, d.status, d.last_seen,
+                   b.accepted_at, d.network
+            FROM devices d
+            LEFT JOIN baseline b ON d.id = b.device_id AND b.service_id IS NULL
+            ORDER BY d.network ASC, d.ip ASC
+        """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    devices = []
+    for row in rows:
+        devices.append({
+            "id":          row[0],
+            "ip":          row[1],
+            "mac":         row[2] or "-",
+            "hostname":    row[3] or "-",
+            "status":      row[4],
+            "last_seen":   row[5],
+            "accepted_at": row[6] or "-",
+            "network":     row[7] or "-",
+        })
+
+    networks = set(d["network"] for d in devices)
+
+    return {
+        "devices":           devices,
+        "total":             len(devices),
+        "accepted":          sum(1 for d in devices if d["status"] == "accepted"),
+        "pending":           sum(1 for d in devices if d["status"] == "pending"),
+        "multiple_networks": len(networks) > 1,
+    }
+
+
+def db_get_services_status(network: str = None) -> dict:
+    """
+    Fetches all services with their device info from the database.
+    If network is given, filters by network.
+    Returns a dict with services and summary counters.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    if network:
+        cur.execute("""
+            SELECT s.id, s.port, s.protocol, s.service, s.version, s.last_seen,
+                   d.ip, d.hostname, b.accepted_at, d.network
+            FROM services s
+            JOIN devices d ON s.device_id = d.id
+            LEFT JOIN baseline b ON s.id = b.service_id AND b.service_id IS NOT NULL
+            WHERE d.network = ?
+            ORDER BY d.ip ASC, CAST(s.port AS INTEGER) ASC
+        """, (network,))
+    else:
+        cur.execute("""
+            SELECT s.id, s.port, s.protocol, s.service, s.version, s.last_seen,
+                   d.ip, d.hostname, b.accepted_at, d.network
+            FROM services s
+            JOIN devices d ON s.device_id = d.id
+            LEFT JOIN baseline b ON s.id = b.service_id AND b.service_id IS NOT NULL
+            ORDER BY d.network ASC, d.ip ASC, CAST(s.port AS INTEGER) ASC
+        """)
+
+    rows = cur.fetchall()
+    conn.close()
+
+    services = []
+    for row in rows:
+        services.append({
+            "id":        row[0],
+            "port":      row[1],
+            "protocol":  row[2],
+            "service":   row[3] or "-",
+            "version":   row[4] or "-",
+            "last_seen": row[5],
+            "ip":        row[6],
+            "hostname":  row[7] or "-",
+            "accepted":  row[8] is not None,
+            "network":   row[9] or "-",
+        })
+
+    networks = set(s["network"] for s in services)
+
+    return {
+        "services":          services,
+        "total":             len(services),
+        "accepted":          sum(1 for s in services if s["accepted"]),
+        "pending":           sum(1 for s in services if not s["accepted"]),
+        "multiple_networks": len(networks) > 1,
+    }
+
+
+def print_status(data: dict):
+    """
+    Prints a formatted device status table to the console.
+    PENDING devices are highlighted in red.
+    Network column shown only when multiple networks are present.
+    Includes action hints if pending devices exist.
+    """
+    width = 110
+    show_network = data["multiple_networks"]
+    pending_devices = []
+
+    print()
+    print(BOLD + "DEVICES" + RESET)
+    print("─" * width)
+
+    if show_network:
+        print(f"{'ID':<4}  {'Network':<18} {'IP':<16} {'MAC':<18} {'Hostname':<30} {'Status':<10} {'Last Seen'}")
+    else:
+        print(f"{'ID':<4}  {'IP':<16} {'MAC':<18} {'Hostname':<40} {'Status':<10} {'Last Seen'}")
+
+    print("─" * width)
+
+    for d in data["devices"]:
+        last_seen = d["last_seen"][:16].replace("T", " ") if d["last_seen"] else "-"
+
+        if show_network:
+            row = (
+                f"{d['id']:<4}  "
+                f"{d['network']:<18} "
+                f"{d['ip']:<16} "
+                f"{d['mac']:<18} "
+                f"{d['hostname']:<30} "
+                f"{d['status']:<10} "
+                f"{last_seen}"
+            )
+        else:
+            row = (
+                f"{d['id']:<4}  "
+                f"{d['ip']:<16} "
+                f"{d['mac']:<18} "
+                f"{d['hostname']:<40} "
+                f"{d['status']:<10} "
+                f"{last_seen}"
+            )
+
+        if d["status"] == "pending":
+            print(RED + BOLD + row + RESET)
+            pending_devices.append(d)
+        else:
+            print(GREEN + row + RESET)
+
+    print("─" * width)
+    print(
+        f"Total: {data['total']} devices  |  "
+        f"{GREEN}Accepted: {data['accepted']}{RESET}  |  "
+        f"{RED}Pending: {data['pending']}{RESET}"
+    )
+
+    if pending_devices:
+        print()
+        print(BOLD + YELLOW + "ACTION REQUIRED" + RESET)
+        print("─" * width)
+        for d in pending_devices:
+            print(f"  ares --accept-device {d['ip']}")
+
+    print()
+
+
+def print_services_status(data: dict):
+    """
+    Prints a formatted services status table to the console.
+    PENDING services are highlighted in red.
+    Network column shown only when multiple networks are present.
+    """
+    width = 110
+    show_network = data["multiple_networks"]
+    pending_services = []
+
+    print()
+    print(BOLD + "SERVICES" + RESET)
+    print("─" * width)
+
+    if show_network:
+        print(f"{'ID':<4}  {'Network':<18} {'IP':<16} {'Hostname':<25} {'Port':<6} {'Proto':<6} {'Service':<12} {'Version':<20} {'Status'}")
+    else:
+        print(f"{'ID':<4}  {'IP':<16} {'Hostname':<40} {'Port':<6} {'Proto':<6} {'Service':<12} {'Version':<20} {'Status'}")
+
+    print("─" * width)
+
+    for s in data["services"]:
+        status = "accepted" if s["accepted"] else "pending"
+
+        if show_network:
+            row = (
+                f"{s['id']:<4}  "
+                f"{s['network']:<18} "
+                f"{s['ip']:<16} "
+                f"{s['hostname']:<25} "
+                f"{s['port']:<6} "
+                f"{s['protocol']:<6} "
+                f"{s['service']:<12} "
+                f"{s['version']:<20} "
+                f"{status}"
+            )
+        else:
+            row = (
+                f"{s['id']:<4}  "
+                f"{s['ip']:<16} "
+                f"{s['hostname']:<40} "
+                f"{s['port']:<6} "
+                f"{s['protocol']:<6} "
+                f"{s['service']:<12} "
+                f"{s['version']:<20} "
+                f"{status}"
+            )
+
+        if not s["accepted"]:
+            print(RED + BOLD + row + RESET)
+            pending_services.append(s)
+        else:
+            print(GREEN + row + RESET)
+
+    print("─" * width)
+    print(
+        f"Total: {data['total']} services  |  "
+        f"{GREEN}Accepted: {data['accepted']}{RESET}  |  "
+        f"{RED}Pending: {data['pending']}{RESET}"
+    )
+
+    if pending_services:
+        print()
+        print(BOLD + YELLOW + "ACTION REQUIRED" + RESET)
+        print("─" * width)
+        for s in pending_services:
+            print(f"  ares --accept-device {s['ip']}")
+
+    print()
+
+
+# ─── SCAN RUNNER ──────────────────────────────────────────────────────────────
+
+def run_scan(network: str, interface: str, mode: str, loki: str | None,
+             scan_devices: bool, scan_services: bool):
+    """
+    Runs a scan for a single network.
+    Handles device scan, optional service scan, and deviation check.
+    """
+    if scan_devices:
+        log_and_push(loki, "scan_start", network=network)
+        print(f"[INFO] Scanning network {network}...")
+
+        xml_devices = run_nmap(network, interface, mode)
+        devices = parse_nmap_xml(xml_devices)
+        print_devices_list(devices)
+
+        db_save_devices(devices, network)
+
+        for d in devices:
+            log_and_push(loki, "device_seen",
+                         ip=d["ip"], mac=d["mac"] or "-",
+                         hostname=d["hostname"] or "-",
+                         network=network)
+
+    if scan_services:
+        print(f"[INFO] Starting service scan for {network} (this may take a while)...")
+        xml_services = run_nmap_services(network, interface)
+        services = parse_nmap_services_xml(xml_services)
+        print_services_list(services)
+
+        version_changes = db_save_services(services)
+
+        for vc in version_changes:
+            log_and_push(loki, "version_change", level="warn",
+                         port=vc["port"],
+                         service=vc["service"],
+                         old_version=vc["old_version"],
+                         new_version=vc["new_version"],
+                         network=network)
+
+    if scan_devices:
+        deviations = db_check_deviations(network)
+
+        for dev in deviations:
+            if dev["event_type"] == "new_device":
+                log_and_push(loki, "new_device", level="warn",
+                             ip=dev["ip"], mac=dev["mac"],
+                             hostname=dev["hostname"], network=network)
+
+            elif dev["event_type"] == "new_port":
+                log_and_push(loki, "new_port", level="warn",
+                             ip=dev["ip"], port=dev["port"],
+                             service=dev["service"], version=dev["version"],
+                             network=network)
+
+        log_and_push(loki, "scan_complete",
+                     total_devices=len(devices) if scan_devices else 0,
+                     unknown_count=len(deviations),
+                     network=network)
+
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="ARES network and device scanner")
+
+    # ── Network / config arguments
+    parser.add_argument("--network",   required=False,
+                        help="Target network e.g. 192.168.2.0/24 (overrides config)")
+    parser.add_argument("--interface", required=False, default="",
+                        help="Network interface e.g. eth1 (optional)")
+    parser.add_argument("--mode",      required=False, default="arp",
+                        choices=["arp", "ip"],
+                        help="Scan mode: arp (L2, MAC visible) or ip (L3, no MAC)")
+    parser.add_argument("--loki-url",  default=None,
+                        help="Loki Push URL e.g. http://10.8.0.1:3100 (optional)")
+
+    # ── Scan arguments
+    parser.add_argument("--scan-devices", action="store_true",
+                        help="Run device discovery scan (fast)")
+    parser.add_argument("--scan-services", action="store_true",
+                        help="Run service and version scan (slow)")
+    parser.add_argument("--scan-all", action="store_true",
+                        help="Run device scan + service scan")
+
+    # ── Baseline arguments
+    parser.add_argument("--accept-baseline", action="store_true",
+                        help="Accept and freeze current state as baseline")
+    parser.add_argument("--reset-baseline", action="store_true",
+                        help="Reset baseline – all devices set back to pending")
+    parser.add_argument("--accept-device", metavar="IP",
+                        help="Accept a single device by IP address")
+
+    # ── Admin arguments
+    parser.add_argument("--status", action="store_true",
+                        help="Alias for --status-all (backwards compatible)")
+    parser.add_argument("--status-devices", action="store_true",
+                        help="Show device status table")
+    parser.add_argument("--status-services", action="store_true",
+                        help="Show services status table")
+    parser.add_argument("--status-all", action="store_true",
+                        help="Show devices and services status tables")
+
+    args = parser.parse_args()
+
+    # ── Load config
+    config   = load_config()
+    networks = get_networks(config)
+
+    # ── Loki URL: CLI overrides config
+    loki = args.loki_url or config.get("global", "loki_url", fallback=None)
+
+    # ── DB init – always runs first
+    db_init()
+
+    # ── Admin operations – no scan needed
+    if args.status or args.status_all:
+        width = 110
+        print()
+        print(BOLD + "ARES Network Scanner – Status" + RESET)
+        print("═" * width)
+        print_status(db_get_status(args.network))
+        print_services_status(db_get_services_status(args.network))
+        print("═" * width)
+        print()
+        sys.exit(0)
+
+    if args.status_devices:
+        width = 110
+        print()
+        print(BOLD + "ARES Network Scanner – Status" + RESET)
+        print("═" * width)
+        print_status(db_get_status(args.network))
+        print("═" * width)
+        print()
+        sys.exit(0)
+
+    if args.status_services:
+        width = 110
+        print()
+        print(BOLD + "ARES Network Scanner – Status" + RESET)
+        print("═" * width)
+        print_services_status(db_get_services_status(args.network))
+        print("═" * width)
+        print()
+        sys.exit(0)
+
+    # ── Baseline operations – no scan needed
+    if args.accept_baseline:
+        db_accept_baseline()
+        sys.exit(0)
+
+    if args.reset_baseline:
+        db_reset_baseline()
+        sys.exit(0)
+
+    if args.accept_device:
+        db_accept_device(args.accept_device)
+        sys.exit(0)
+
+    # ── Determine scan flags
+    scan_devices  = args.scan_devices or args.scan_all
+    scan_services = args.scan_services or args.scan_all
+
+    if not scan_devices and not scan_services:
+        parser.error("Specify a scan mode: --scan-devices, --scan-services, or --scan-all")
+
+    # ── Scan: CLI network overrides config networks
+    if args.network:
+        # Single network from CLI
+        run_scan(
+            network=args.network,
+            interface=args.interface,
+            mode=args.mode,
+            loki=loki,
+            scan_devices=scan_devices,
+            scan_services=scan_services
+        )
+
+    elif networks:
+        # Multiple networks from config
+        for net in networks:
+            run_scan(
+                network=net["network"],
+                interface=net["interface"],
+                mode=net["mode"],
+                loki=loki,
+                scan_devices=scan_devices,
+                scan_services=scan_services
+            )
+
+    else:
+        parser.error("No network specified. Use --network or define networks in /etc/ares/ares.conf")
+
+
+if __name__ == "__main__":
+    main()
